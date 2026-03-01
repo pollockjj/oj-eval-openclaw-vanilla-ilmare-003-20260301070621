@@ -2,13 +2,14 @@
 #include <cstring>
 #include <algorithm>
 #include <vector>
-#include <string>
 #include <unordered_map>
+#include <string>
 
 using namespace std;
 
 static const int MAXN = 10001;
 static const int MAXP = 26;
+static const int BIG = 1000000;
 
 struct FrozenSub {
     int status;
@@ -33,14 +34,14 @@ struct SubInfo {
 struct RankKey {
     int neg_solved;
     int penalty;
-    int stimes[MAXP];
+    int stimes[MAXP]; // sorted desc, padded with BIG
 };
 
 struct Team {
     char name[22];
     ProblemState probs[MAXP];
     RankKey key;
-    int frozen_prob_count; // number of frozen problems
+    int frozen_prob_count;
     
     vector<SubInfo> all_subs;
     int last_any;
@@ -52,16 +53,16 @@ struct Team {
         key.neg_solved = 0;
         key.penalty = 0;
         frozen_prob_count = 0;
-        for (int i = 0; i < MAXP; i++) key.stimes[i] = 1000000;
+        for (int i = 0; i < MAXP; i++) key.stimes[i] = BIG;
         last_any = -1;
         memset(last_by_prob, -1, sizeof(last_by_prob));
         memset(last_by_status, -1, sizeof(last_by_status));
         memset(last_by_both, -1, sizeof(last_by_both));
     }
     
-    void add_sub(int prob, int status, int time) {
+    void add_sub(int prob, int status, int t) {
         int idx = (int)all_subs.size();
-        all_subs.push_back({prob, status, time});
+        all_subs.push_back({prob, status, t});
         last_any = idx;
         last_by_prob[prob] = idx;
         last_by_status[status] = idx;
@@ -69,9 +70,8 @@ struct Team {
     }
     
     void recalculate(int pc) {
-        int sc = 0;
+        int sc = 0, cnt = 0;
         key.penalty = 0;
-        int cnt = 0;
         for (int i = 0; i < pc; i++) {
             if (probs[i].solved && !probs[i].is_frozen) {
                 key.stimes[cnt++] = probs[i].ac_time;
@@ -80,8 +80,17 @@ struct Team {
             }
         }
         key.neg_solved = -sc;
-        sort(key.stimes, key.stimes + cnt, greater<int>());
-        for (int i = cnt; i < MAXP; i++) key.stimes[i] = 1000000;
+        // Insertion sort since cnt <= 26, often partially sorted
+        for (int i = 1; i < cnt; i++) {
+            int tmp = key.stimes[i];
+            int j = i - 1;
+            while (j >= 0 && key.stimes[j] < tmp) {
+                key.stimes[j + 1] = key.stimes[j];
+                j--;
+            }
+            key.stimes[j + 1] = tmp;
+        }
+        for (int i = cnt; i < MAXP; i++) key.stimes[i] = BIG;
     }
 };
 
@@ -94,28 +103,35 @@ int rank_pos[MAXN];
 int problem_count = 0;
 bool competition_started = false;
 bool is_frozen = false;
-bool dirty[MAXN];
-int tmp_clean[MAXN], tmp_dirty[MAXN];
+bool dirty_flag[MAXN];
+int tmp_a[MAXN], tmp_b[MAXN];
 
 const char* status_strs[] = {"Accepted", "Wrong_Answer", "Runtime_Error", "Time_Limit_Exceed"};
 
 inline int parse_status(const char* s) {
-    if (s[0] == 'A') return 0;
-    if (s[0] == 'W') return 1;
-    if (s[0] == 'R') return 2;
-    return 3;
+    switch (s[0]) {
+        case 'A': return 0;
+        case 'W': return 1;
+        case 'R': return 2;
+        default: return 3;
+    }
+}
+
+inline int key_cmp(int a, int b) {
+    // Returns <0 if a ranks higher, >0 if b ranks higher, 0 if equal on key (then name)
+    const RankKey& ka = teams[a].key;
+    const RankKey& kb = teams[b].key;
+    if (ka.neg_solved != kb.neg_solved) return ka.neg_solved - kb.neg_solved;
+    if (ka.penalty != kb.penalty) return ka.penalty - kb.penalty;
+    int sc = -ka.neg_solved;
+    for (int i = 0; i < sc; i++) {
+        if (ka.stimes[i] != kb.stimes[i]) return ka.stimes[i] - kb.stimes[i];
+    }
+    return strcmp(teams[a].name, teams[b].name);
 }
 
 inline bool rank_cmp(int a, int b) {
-    const RankKey& ka = teams[a].key;
-    const RankKey& kb = teams[b].key;
-    if (ka.neg_solved != kb.neg_solved) return ka.neg_solved < kb.neg_solved;
-    if (ka.penalty != kb.penalty) return ka.penalty < kb.penalty;
-    int sc = -ka.neg_solved;
-    for (int i = 0; i < sc; i++) {
-        if (ka.stimes[i] != kb.stimes[i]) return ka.stimes[i] < kb.stimes[i];
-    }
-    return strcmp(teams[a].name, teams[b].name) < 0;
+    return key_cmp(a, b) < 0;
 }
 
 void rebuild_rank_pos() {
@@ -124,60 +140,92 @@ void rebuild_rank_pos() {
 
 void do_flush() {
     for (int i = 0; i < n_teams; i++) {
-        if (dirty[i]) teams[i].recalculate(problem_count);
+        if (dirty_flag[i]) teams[i].recalculate(problem_count);
     }
     
     int nc = 0, nd = 0;
     for (int i = 0; i < n_teams; i++) {
         int tidx = ranking[i];
-        if (dirty[tidx]) tmp_dirty[nd++] = tidx;
-        else tmp_clean[nc++] = tidx;
+        if (dirty_flag[tidx]) tmp_b[nd++] = tidx;
+        else tmp_a[nc++] = tidx;
     }
     
-    memset(dirty, 0, sizeof(bool) * n_teams);
+    memset(dirty_flag, 0, n_teams);
     
-    sort(tmp_dirty, tmp_dirty + nd, rank_cmp);
-    
-    int ic = 0, id = 0, ir = 0;
-    while (ic < nc && id < nd) {
-        if (rank_cmp(tmp_clean[ic], tmp_dirty[id]))
-            ranking[ir++] = tmp_clean[ic++];
-        else
-            ranking[ir++] = tmp_dirty[id++];
+    if (nd > 0) {
+        sort(tmp_b, tmp_b + nd, rank_cmp);
+        
+        int ic = 0, id = 0, ir = 0;
+        while (ic < nc && id < nd) {
+            if (rank_cmp(tmp_a[ic], tmp_b[id]))
+                ranking[ir++] = tmp_a[ic++];
+            else
+                ranking[ir++] = tmp_b[id++];
+        }
+        while (ic < nc) ranking[ir++] = tmp_a[ic++];
+        while (id < nd) ranking[ir++] = tmp_b[id++];
     }
-    while (ic < nc) ranking[ir++] = tmp_clean[ic++];
-    while (id < nd) ranking[ir++] = tmp_dirty[id++];
     
     rebuild_rank_pos();
 }
 
+// Output buffer
+static char obuf[1 << 22];
+static int opos = 0;
+
+inline void oflush() {
+    fwrite(obuf, 1, opos, stdout);
+    opos = 0;
+}
+
+inline void oputc(char c) {
+    obuf[opos++] = c;
+    if (opos >= (1 << 22) - 256) oflush();
+}
+
+inline void oputs(const char* s) {
+    while (*s) obuf[opos++] = *s++;
+    if (opos >= (1 << 22) - 256) oflush();
+}
+
+inline void oputn(int n) {
+    if (n < 0) { oputc('-'); n = -n; }
+    if (n == 0) { oputc('0'); return; }
+    char tmp[12];
+    int len = 0;
+    while (n > 0) { tmp[len++] = '0' + n % 10; n /= 10; }
+    for (int i = len - 1; i >= 0; i--) oputc(tmp[i]);
+}
+
 void print_problem(const ProblemState& ps) {
+    oputc(' ');
     if (ps.is_frozen) {
-        if (ps.attempts_before_ac == 0)
-            printf(" 0/%d", ps.frozen_count);
-        else
-            printf(" -%d/%d", ps.attempts_before_ac, ps.frozen_count);
+        if (ps.attempts_before_ac == 0) {
+            oputc('0'); oputc('/'); oputn(ps.frozen_count);
+        } else {
+            oputc('-'); oputn(ps.attempts_before_ac); oputc('/'); oputn(ps.frozen_count);
+        }
         return;
     }
     if (ps.solved) {
-        if (ps.attempts_before_ac == 0) printf(" +");
-        else printf(" +%d", ps.attempts_before_ac);
+        oputc('+');
+        if (ps.attempts_before_ac > 0) oputn(ps.attempts_before_ac);
         return;
     }
-    if (ps.attempts_before_ac == 0) printf(" .");
-    else printf(" -%d", ps.attempts_before_ac);
+    if (ps.attempts_before_ac == 0) oputc('.');
+    else { oputc('-'); oputn(ps.attempts_before_ac); }
 }
 
 void print_scoreboard() {
     for (int i = 0; i < n_teams; i++) {
         Team& t = teams[ranking[i]];
-        printf("%s %d %d %d", t.name, i + 1, -t.key.neg_solved, t.key.penalty);
+        oputs(t.name); oputc(' '); oputn(i + 1); oputc(' ');
+        oputn(-t.key.neg_solved); oputc(' '); oputn(t.key.penalty);
         for (int j = 0; j < problem_count; j++) print_problem(t.probs[j]);
-        putchar('\n');
+        oputc('\n');
     }
 }
 
-// Unfreeze a problem. Returns true if AC was found.
 bool unfreeze_problem(Team& t, int fp) {
     ProblemState& ps = t.probs[fp];
     ps.is_frozen = false;
@@ -199,32 +247,68 @@ bool unfreeze_problem(Team& t, int fp) {
     return got_ac;
 }
 
+// Input buffer
+static char ibuf[1 << 22];
+static int ibufpos = 0, ibuflen = 0;
+
+inline int igetc() {
+    if (ibufpos >= ibuflen) {
+        ibuflen = fread(ibuf, 1, sizeof(ibuf), stdin);
+        ibufpos = 0;
+        if (ibuflen == 0) return -1;
+    }
+    return (unsigned char)ibuf[ibufpos++];
+}
+
+inline bool iread(char* s) {
+    int c;
+    while ((c = igetc()) != -1 && (c == ' ' || c == '\n' || c == '\r'));
+    if (c == -1) return false;
+    *s++ = c;
+    while ((c = igetc()) != -1 && c != ' ' && c != '\n' && c != '\r') *s++ = c;
+    *s = 0;
+    return true;
+}
+
+inline bool ireadint(int& v) {
+    int c;
+    while ((c = igetc()) != -1 && (c == ' ' || c == '\n' || c == '\r'));
+    if (c == -1) return false;
+    v = 0;
+    bool neg = false;
+    if (c == '-') { neg = true; c = igetc(); }
+    v = c - '0';
+    while ((c = igetc()) != -1 && c >= '0' && c <= '9') v = v * 10 + c - '0';
+    if (neg) v = -v;
+    return true;
+}
+
 char buf[64];
 
 int main() {
-    memset(dirty, 0, sizeof(dirty));
+    memset(dirty_flag, 0, sizeof(dirty_flag));
     
-    while (scanf("%s", buf) == 1) {
+    while (iread(buf)) {
         if (buf[0] == 'A' && buf[1] == 'D') {
             char name[22];
-            scanf("%s", name);
+            iread(name);
             if (competition_started) {
-                printf("[Error]Add failed: competition has started.\n");
+                oputs("[Error]Add failed: competition has started.\n");
             } else if (team_index.count(name)) {
-                printf("[Error]Add failed: duplicated team name.\n");
+                oputs("[Error]Add failed: duplicated team name.\n");
             } else {
                 int idx = n_teams++;
                 team_index[name] = idx;
                 teams[idx].init();
                 strcpy(teams[idx].name, name);
                 ranking[idx] = idx;
-                printf("[Info]Add successfully.\n");
+                oputs("[Info]Add successfully.\n");
             }
         } else if (buf[0] == 'S' && buf[1] == 'T' && buf[2] == 'A') {
             int dt, pc;
-            scanf("%s %d %s %d", buf, &dt, buf, &pc);
+            iread(buf); ireadint(dt); iread(buf); ireadint(pc);
             if (competition_started) {
-                printf("[Error]Start failed: competition has started.\n");
+                oputs("[Error]Start failed: competition has started.\n");
             } else {
                 problem_count = pc;
                 competition_started = true;
@@ -232,12 +316,12 @@ int main() {
                     return strcmp(teams[a].name, teams[b].name) < 0;
                 });
                 rebuild_rank_pos();
-                printf("[Info]Competition starts.\n");
+                oputs("[Info]Competition starts.\n");
             }
         } else if (buf[0] == 'S' && buf[1] == 'U') {
             char prob_s[4], team_name[22], status_s[22];
             int time_val;
-            scanf("%s %s %s %s %s %s %d", prob_s, buf, team_name, buf, status_s, buf, &time_val);
+            iread(prob_s); iread(buf); iread(team_name); iread(buf); iread(status_s); iread(buf); ireadint(time_val);
             
             int prob = prob_s[0] - 'A';
             int status = parse_status(status_s);
@@ -262,29 +346,27 @@ int main() {
                     ps.attempts_before_ac++;
                 }
             }
-            dirty[tidx] = true;
+            dirty_flag[tidx] = true;
         } else if (buf[0] == 'F' && buf[1] == 'L') {
-            printf("[Info]Flush scoreboard.\n");
+            oputs("[Info]Flush scoreboard.\n");
             do_flush();
         } else if (buf[0] == 'F' && buf[1] == 'R') {
             if (is_frozen) {
-                printf("[Error]Freeze failed: scoreboard has been frozen.\n");
+                oputs("[Error]Freeze failed: scoreboard has been frozen.\n");
             } else {
                 is_frozen = true;
-                printf("[Info]Freeze scoreboard.\n");
+                oputs("[Info]Freeze scoreboard.\n");
             }
         } else if (buf[0] == 'S' && buf[1] == 'C' && buf[2] == 'R') {
             if (!is_frozen) {
-                printf("[Error]Scroll failed: scoreboard has not been frozen.\n");
+                oputs("[Error]Scroll failed: scoreboard has not been frozen.\n");
             } else {
-                printf("[Info]Scroll scoreboard.\n");
+                oputs("[Info]Scroll scoreboard.\n");
                 do_flush();
                 print_scoreboard();
                 
-                // Optimized scroll: use pointer, skip non-AC unfreezes
                 int check_from = n_teams - 1;
                 while (check_from >= 0) {
-                    // Find lowest-ranked team with frozen problems
                     int r = -1;
                     for (int i = check_from; i >= 0; i--) {
                         if (teams[ranking[i]].frozen_prob_count > 0) {
@@ -299,7 +381,6 @@ int main() {
                     bool moved = false;
                     
                     while (t.frozen_prob_count > 0) {
-                        // Find smallest frozen problem
                         int fp = -1;
                         for (int p = 0; p < problem_count; p++) {
                             if (t.probs[p].is_frozen) { fp = p; break; }
@@ -311,27 +392,28 @@ int main() {
                             t.recalculate(problem_count);
                             
                             // Binary search for new position
-                            // Team can only move up (lower index = better rank)
-                            // Linear scan up from r-1 (often quick)
-                            int new_rank = r;
-                            while (new_rank > 0 && rank_cmp(tidx, ranking[new_rank - 1])) {
-                                new_rank--;
+                            int lo = 0, hi = r;
+                            while (lo < hi) {
+                                int mid = (lo + hi) >> 1;
+                                if (rank_cmp(tidx, ranking[mid]))
+                                    hi = mid;
+                                else
+                                    lo = mid + 1;
                             }
+                            int new_rank = lo;
                             
                             if (new_rank < r) {
                                 int replaced = ranking[new_rank];
-                                // Shift and update rank_pos
-                                for (int i = r; i > new_rank; i--) {
-                                    ranking[i] = ranking[i - 1];
-                                    rank_pos[ranking[i]] = i;
-                                }
+                                memmove(&ranking[new_rank + 1], &ranking[new_rank], (r - new_rank) * sizeof(int));
                                 ranking[new_rank] = tidx;
-                                rank_pos[tidx] = new_rank;
+                                // Update rank_pos for shifted teams
+                                for (int i = new_rank; i <= r; i++) rank_pos[ranking[i]] = i;
                                 
-                                printf("%s %s %d %d\n", t.name, teams[replaced].name,
-                                       -t.key.neg_solved, t.key.penalty);
+                                oputs(t.name); oputc(' ');
+                                oputs(teams[replaced].name); oputc(' ');
+                                oputn(-t.key.neg_solved); oputc(' ');
+                                oputn(t.key.penalty); oputc('\n');
                                 
-                                // After move, restart scan from r (teams shifted down)
                                 check_from = r;
                                 moved = true;
                                 break;
@@ -340,7 +422,6 @@ int main() {
                     }
                     
                     if (!moved) {
-                        // Team fully unfrozen without moving, continue upward
                         check_from = r - 1;
                     }
                 }
@@ -350,28 +431,28 @@ int main() {
             }
         } else if (buf[0] == 'Q' && buf[6] == 'R') {
             char name[22];
-            scanf("%s", name);
+            iread(name);
             auto it = team_index.find(name);
             if (it == team_index.end()) {
-                printf("[Error]Query ranking failed: cannot find the team.\n");
+                oputs("[Error]Query ranking failed: cannot find the team.\n");
             } else {
-                printf("[Info]Complete query ranking.\n");
+                oputs("[Info]Complete query ranking.\n");
                 if (is_frozen)
-                    printf("[Warning]Scoreboard is frozen. The ranking may be inaccurate until it were scrolled.\n");
-                printf("%s NOW AT RANKING %d\n", name, rank_pos[it->second] + 1);
+                    oputs("[Warning]Scoreboard is frozen. The ranking may be inaccurate until it were scrolled.\n");
+                oputs(name); oputs(" NOW AT RANKING "); oputn(rank_pos[it->second] + 1); oputc('\n');
             }
         } else if (buf[0] == 'Q' && buf[6] == 'S') {
             char team_name[22], prob_part[32], status_part[32];
-            scanf("%s %s %s %s %s", team_name, buf, prob_part, buf, status_part);
+            iread(team_name); iread(buf); iread(prob_part); iread(buf); iread(status_part);
             
             char* prob_val = prob_part + 8;
             char* stat_val = status_part + 7;
             
             auto it = team_index.find(team_name);
             if (it == team_index.end()) {
-                printf("[Error]Query submission failed: cannot find the team.\n");
+                oputs("[Error]Query submission failed: cannot find the team.\n");
             } else {
-                printf("[Info]Complete query submission.\n");
+                oputs("[Info]Complete query submission.\n");
                 int tidx = it->second;
                 Team& t = teams[tidx];
                 
@@ -390,16 +471,20 @@ int main() {
                 }
                 
                 if (last_idx == -1) {
-                    printf("Cannot find any submission.\n");
+                    oputs("Cannot find any submission.\n");
                 } else {
                     SubInfo& s = t.all_subs[last_idx];
-                    printf("%s %c %s %d\n", team_name, 'A' + s.problem, status_strs[s.status], s.time);
+                    oputs(team_name); oputc(' ');
+                    oputc('A' + s.problem); oputc(' ');
+                    oputs(status_strs[s.status]); oputc(' ');
+                    oputn(s.time); oputc('\n');
                 }
             }
         } else if (buf[0] == 'E') {
-            printf("[Info]Competition ends.\n");
+            oputs("[Info]Competition ends.\n");
             break;
         }
     }
+    oflush();
     return 0;
 }
